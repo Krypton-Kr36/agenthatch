@@ -50,11 +50,8 @@ agenthatch/
 │   │   └── commands/
 │   ├── skill/                       # SKILL.md parsing, 6-harness LLM pipeline
 │   ├── generate/                    # Jinja2 templates, Agent code generation
-│   ├── agent/                       # Runtime, built-in tools, MCP
 │   ├── house/                       # Skillhouse index and discovery
 │   ├── config/                      # Config loading and validation
-│   ├── cap/                         # Capability bus and marshal
-│   ├── base/                        # Sandbox base classes
 │   ├── output/                      # Output sanitization
 │   ├── providers.py                 # LLM provider abstraction
 │   ├── exceptions.py                # Custom exceptions
@@ -75,7 +72,7 @@ agenthatch/
 │       ├── state.py                 # Agent state management
 │       ├── hooks.py                 # Lifecycle hooks
 │       └── types.py                 # Core type definitions
-└── tests/                           # pytest suite (157 tests) with SKILL.md fixtures
+└── tests/                           # pytest suite (684 tests) with SKILL.md fixtures
 ```
 
 Both `src/agenthatch` and `agenthatch-core/src/agenthatch_core` are bundled into

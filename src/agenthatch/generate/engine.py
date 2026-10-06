@@ -17,6 +17,8 @@ from typing import Any
 
 import jinja2
 
+from agenthatch import __version__ as _agenthatch_version
+
 logger = logging.getLogger(__name__)
 
 # Template file → output file mapping (relative to agent output root)
@@ -255,6 +257,11 @@ class GenerateEngine:
             # v1.0.0: Knowledge base — None when no KB declared
             "kb": kb_vars,
             "kb_enabled": kb_vars is not None,
+            # Floor for the generated agent's ``agenthatch`` dependency:
+            # the core runtime ships inside the main wheel (no separate
+            # agenthatch-core on PyPI), so the floor is the generating
+            # version itself.
+            "agenthatch_version": _agenthatch_version,
         }
 
     @staticmethod

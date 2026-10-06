@@ -5,7 +5,7 @@ Covers:
 - Bug #3: discover_kb_files() applies exclude_patterns
 - Bug #5: KnowledgeBaseConfig cross-field validator (chunk_overlap < chunk_size)
 - Bug #6: hatch.py refreshes skill_dir/agenthatch.yaml with post-Phase 3.5 KB stats
-- Bug #7: pyproject.toml.j2 includes agenthatch-core when kb_enabled
+- Bug #7: pyproject.toml.j2 declares the main agenthatch package (bundling agenthatch_core) for every agent, KB or not
 - Bug #8: KnowledgeStore.search(top_k<=0) returns []
 - Bug #9: _fuse_results doesn't leak zero-score results when alpha=1.0 or 0.0
 - Bug #10: retrieve() top_k no longer silently clamped to RETRIEVAL_TOP_K
@@ -222,17 +222,20 @@ class TestBug5ChunkOverlapLtSizeValidator:
 
 
 # ---------------------------------------------------------------------------
-# Bug #7: pyproject.toml.j2 declares agenthatch-core when kb_enabled
+# Bug #7: pyproject.toml.j2 declares the runtime dependency for every agent
 # ---------------------------------------------------------------------------
 
 class TestBug7PyprojectDeclaresKBDependencies:
-    """Bug #7: Generated pyproject.toml must declare agenthatch-core.
+    """Bug #7: Generated pyproject.toml must make ``agenthatch_core`` importable.
 
-    Without this, ``pip install -e .`` succeeds but ``retrieve()``
-    silently returns ``[]`` for every query (the ImportError inside
-    ``_get_store()`` is swallowed).  The template must conditionally
-    add ``agenthatch-core`` to ``[project].dependencies`` when
-    ``kb_enabled`` is True.
+    v1.0.1 declared ``agenthatch-core>=1.0.2`` for KB agents only — but
+    that distribution was never published to PyPI, so ``pip install`` of
+    a generated KB agent failed at resolution time, and non-KB agents
+    (whose ``agent.py`` imports ``agenthatch_core`` unconditionally)
+    declared nothing at all.  The core runtime ships inside the main
+    ``agenthatch`` wheel, so the template now declares
+    ``agenthatch>=<generating version>`` for EVERY agent, KB or not.
+    ``sentence-transformers`` stays KB-only.
     """
 
     def _render(self, kb_enabled: bool) -> str:
@@ -246,22 +249,57 @@ class TestBug7PyprojectDeclaresKBDependencies:
             description="test",
             package_name="test_agent",
             kb_enabled=kb_enabled,
+            agenthatch_version="1.0.26",
         )
 
-    def test_kb_enabled_adds_agenthatch_core_dependency(self) -> None:
+    def test_kb_enabled_declares_agenthatch_dependency(self) -> None:
         rendered = self._render(kb_enabled=True)
-        assert "agenthatch-core" in rendered, (
-            "pyproject.toml must declare agenthatch-core when kb_enabled=True"
+        assert '"agenthatch>=1.0.26"' in rendered, (
+            "pyproject.toml must declare the main agenthatch package "
+            "(which bundles agenthatch_core) when kb_enabled=True"
+        )
+        assert '"agenthatch-core' not in rendered, (
+            "agenthatch-core was never published to PyPI — the template "
+            "must not declare it as a dependency (the leading quote "
+            "distinguishes a TOML dependency from comment mentions)"
         )
         assert "sentence-transformers" in rendered, (
             "pyproject.toml must declare sentence-transformers when kb_enabled=True"
         )
 
-    def test_kb_disabled_omits_agenthatch_core_dependency(self) -> None:
+    def test_kb_disabled_still_declares_agenthatch_dependency(self) -> None:
         rendered = self._render(kb_enabled=False)
-        assert "agenthatch-core" not in rendered, (
-            "pyproject.toml must NOT declare agenthatch-core when kb_enabled=False"
+        assert '"agenthatch>=1.0.26"' in rendered, (
+            "agent.py imports agenthatch_core unconditionally, so even a "
+            "non-KB agent must declare the main agenthatch package"
         )
+        assert "sentence-transformers" not in rendered, (
+            "sentence-transformers stays KB-only"
+        )
+
+    def test_engine_context_injects_real_agenthatch_version(self) -> None:
+        """The dependency floor must come from the installed package.
+
+        Jinja2 renders an undefined variable as an empty string, so if
+        the engine ever drops ``agenthatch_version`` from the context,
+        generated agents would silently declare ``agenthatch>=`` — a
+        floor that pins nothing.  Drive the real context builder with a
+        minimal spec and render through it end to end.
+        """
+        import agenthatch
+        from agenthatch.generate.engine import GenerateEngine
+
+        engine = GenerateEngine()
+        ctx = engine.extract_variables(
+            {
+                "identity": {"id": "test-agent", "version": "0.1.0"},
+                "intent": {"summary": "test"},
+            }
+        )
+        assert ctx["agenthatch_version"] == agenthatch.__version__
+        tpl = engine._env.get_template("pyproject.toml.j2")
+        rendered = tpl.render(**ctx)
+        assert f'"agenthatch>={agenthatch.__version__}"' in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +326,7 @@ class TestBug4PyprojectPackagesKnowledgeDir:
             description="test",
             package_name="test_agent",
             kb_enabled=kb_enabled,
+            agenthatch_version="1.0.26",
         )
 
     def test_kb_enabled_includes_force_include(self) -> None:

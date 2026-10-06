@@ -10,6 +10,18 @@ No unreleased changes.
 
 ***
 
+## \[v1.0.27] — 2026-10-06
+
+### Fixed
+
+* **Generated agents could not be `pip install`ed — the declared runtime dependency does not exist on PyPI** — `agent.py.j2` imports `agenthatch_core` unconditionally (`AHCoreAgent`, `CapBus`, ...), but `pyproject.toml.j2` only declared `agenthatch-core>=1.0.2` in the `kb_enabled` branch (v1.0.1 Bug #7), and that distribution was never published — so a generated KB agent failed at dependency-resolution time, while a non-KB agent declared no runtime dependency on the core at all. The breakage was masked by `agenthatch run`, which loads the agent via `sys.path` injection instead of installing it. Since the core runtime ships inside the main `agenthatch` wheel, the template now declares `agenthatch>=<generating version>` for EVERY agent (KB or not), with the floor injected by `GenerateEngine` as `agenthatch_version` (`from agenthatch import __version__`); `sentence-transformers` stays KB-only. `tests/test_kb_regressions.py` Bug #7 is rewritten to pin the new semantics (previously it asserted non-KB agents must NOT declare the core dependency — locking the bug in), the Bug #4 render call passes `agenthatch_version` explicitly, and a new test drives the real engine context builder to assert the injected floor matches `agenthatch.__version__` (Jinja2 renders an undefined variable as an empty string, so a dropped context key would silently produce `agenthatch>=`).
+
+### Docs
+
+* **CONTRIBUTING.md project structure synced with v1.0.26** — removed the `agent/`, `cap/`, and `base/` tree entries (deleted with the legacy runtime in v1.0.26) and updated the test count from 157 to 684.
+
+***
+
 ## \[v1.0.26] — 2026-10-02
 
 ### Fixed

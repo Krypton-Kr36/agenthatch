@@ -10,15 +10,18 @@ requires-python = ">=3.11"
 dependencies = [
     "typer>=0.15.0",
     "rich>=13.0",
+    # The generated ``agent.py`` imports ``agenthatch_core``
+    # unconditionally (AHCoreAgent, CapBus, ...).  The core runtime
+    # ships inside the main ``agenthatch`` wheel — there is NO
+    # separate ``agenthatch-core`` package on PyPI, so depending on
+    # one would make ``pip install`` of this agent fail at resolution
+    # time.  (v1.0.1 Bug #7 declared ``agenthatch-core>=1.0.2`` for
+    # KB agents only; that package was never published, and non-KB
+    # agents needed the core too.)  Pin the floor to the generating
+    # version so the core API the agent was compiled against is
+    # guaranteed present.
+    "agenthatch>={{ agenthatch_version }}",
 {% if kb_enabled %}
-    # v1.0.1 (Bug #7): The generated ``knowledge_base.py`` imports
-    # ``agenthatch_core.bricks.knowledge.store.KnowledgeStore`` at
-    # runtime.  Without this dependency declared, ``pip install -e .``
-    # succeeds but ``retrieve()`` silently returns ``[]`` for every
-    # query (the ImportError is swallowed by ``_get_store()``'s
-    # exception handler).  Adding ``agenthatch-core`` here ensures
-    # the import resolves.
-    "agenthatch-core>=1.0.2",
     # v1.0.1 (Bug #7): Embedding fusion (BM25 + cosine similarity)
     # requires ``sentence-transformers``.  KnowledgeStore degrades
     # to BM25-only if this isn't installed, but for a KB-native agent
