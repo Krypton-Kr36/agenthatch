@@ -8,7 +8,13 @@ import pytest
 from agenthatch_core.context.manager import ContextManager
 from agenthatch_core.llm.client import LLMClient, ToolCallResponse
 from agenthatch_core.llm.types import StreamDelta, ToolCall
-from agenthatch_core.loop.agent_loop import ConversationLoop, RichToolCallEvent
+from agenthatch_core.loop.agent_loop import (
+    ConversationLoop,
+    RichToolCallEvent,
+    _is_inner_monologue,
+    _strip_evaluation_blocks,
+    _strip_trailing_meta_narration,
+)
 
 from agenthatch_core.sandbox.executor import Sandbox
 from agenthatch_core.tools.bus import CapBus
@@ -293,3 +299,265 @@ class TestDirectLoopC2:
         mock_ctx.add_to_history.assert_called_with(
             "assistant", "Hello world", reasoning_content=None
         )
+
+
+class TestMetaNarrationLeakV1028:
+    """v1.0.28: thought-process / meta-narration leak must not reach the
+    user for ANY agent.
+
+    Previously the sanitize logic was gated behind
+    ``max_consecutive_text_only == 0`` (KB agents only), so ordinary
+    agents returned their own reasoning process as the final answer
+    ("The task is complete. Let me call task_complete.").  All sample
+    texts below are verbatim from real generated-agent transcripts
+    (thinking-style models).
+    """
+
+    _DELIVERABLE = (
+        "Here is the real deliverable content that the user asked for, "
+        "with full details and context."
+    )
+
+    # ── unit: sentence-level strip, empirical English variants ──
+
+    def test_strip_empirical_meta_sentences(self):
+        cases = [
+            "The task is complete.",
+            "The task is essentially done.",
+            "The task is done.",
+            "I already answered.",
+            "I already reported.",
+            "Let me call task_complete.",
+            "I should call task_complete",
+            "I'll call task_complete.",
+            "Call task_complete.",
+            "The user's request is fully done.",
+            "The request is fulfilled.",
+            "All requests done.",
+            "I've delivered the answer.",
+            "Let me finalize.",
+            "Let me quickly double-check everything is fine.",
+        ]
+        for sentence in cases:
+            text = f"{self._DELIVERABLE}\n\n{sentence}"
+            stripped = _strip_trailing_meta_narration(text)
+            assert stripped == self._DELIVERABLE, (
+                f"meta sentence not stripped: {sentence!r} -> {stripped!r}"
+            )
+
+    def test_strip_guard_keeps_original_without_full_strip(self):
+        text = (
+            "The task is complete. I already answered. "
+            "Let me call task_complete."
+        )
+        assert _strip_trailing_meta_narration(text) == text
+        assert _strip_trailing_meta_narration(text, allow_full_strip=True) == ""
+
+    def test_strip_preserves_real_content_without_patterns(self):
+        text = (
+            "The function computes the sum of two numbers and returns "
+            "the result. It handles negative inputs and raises ValueError "
+            "on non-numeric types."
+        )
+        assert _strip_trailing_meta_narration(text) == text
+
+    # ── unit: <evaluation> XML blocks ──
+
+    def test_strip_evaluation_block_closed(self):
+        text = (
+            "Here is the design.\n\n---\n\n"
+            "<evaluation>\n  <qa_pair>\n    <question>q</question>\n"
+            "    <answer>a</answer>\n  </qa_pair>\n</evaluation>\n"
+        )
+        assert _strip_evaluation_blocks(text) == "Here is the design."
+
+    def test_strip_evaluation_block_unclosed(self):
+        text = "Deliverable here.\n\n<evaluation>\n  <qa_pair>truncated"
+        assert _strip_evaluation_blocks(text) == "Deliverable here."
+
+    def test_strip_evaluation_block_absent(self):
+        assert _strip_evaluation_blocks("plain text") == "plain text"
+
+    # ── unit: inner-monologue detector ──
+
+    _MONOLOGUE = (
+        "The user hasn't sent a new message. Wait — the last user turn "
+        "was the FAQ request, and I responded. Hmm, but that's what I "
+        "just did. Let me re-read. But wait, the prompt says the last "
+        "message is assistant. Actually I think I'm now composing the "
+        "final answer. Hmm, this is confusing. So I should end the "
+        "turn. I'll call task_complete. Let me just call task_complete "
+        "since the deliverable is done."
+    )
+
+    def test_inner_monologue_detected(self):
+        assert _is_inner_monologue(self._MONOLOGUE) is True
+
+    def test_inner_monologue_rejects_normal_answers(self):
+        assert _is_inner_monologue("Short answer.") is False
+        long_answer = (
+            "The report covers three regions. North leads with 120 units. "
+            "East follows at 95 units. West trails at 80 units. "
+            "All figures come from the Q4 spreadsheet. "
+            "The total across regions is 295 units."
+        )
+        assert _is_inner_monologue(long_answer) is False
+
+    # ── end-to-end: non-KB agent (default max_consecutive_text_only=13) ──
+
+    def test_run_pure_meta_text_falls_back_to_summary(self, loop, mock_llm):
+        # xlsx-agent turn-1 verbatim leak
+        mock_llm.chat_with_tools.return_value = ToolCallResponse(
+            text=(
+                "The task is complete. I already answered. "
+                "Let me call task_complete."
+            ),
+            tool_calls=[ToolCall(
+                id="c1",
+                name="task_complete",
+                arguments={"summary": "已生成 sales_total.xlsx，F2:F4 含 SUM 公式。"},
+            )],
+        )
+        result = loop.run("计算每个区域的总额")
+        assert result == "已生成 sales_total.xlsx，F2:F4 含 SUM 公式。"
+
+    def test_run_meta_tail_stripped_deliverable_kept(self, loop, mock_llm):
+        # xlsx-agent turn-2 verbatim leak
+        mock_llm.chat_with_tools.return_value = ToolCallResponse(
+            text=(
+                'The file is verified: F1="total", F2:F4 formulas present. '
+                "The recalc couldn't run due to a missing module in this "
+                "environment.\n\nThe user's request is fully done. I'll "
+                "call task_complete with a summary noting the recalc "
+                "limitation."
+            ),
+            tool_calls=[ToolCall(
+                id="c1", name="task_complete", arguments={"summary": "fallback"}
+            )],
+        )
+        result = loop.run("验证公式")
+        assert "task_complete" not in result
+        assert "fully done" not in result
+        assert 'F1="total"' in result
+        assert "recalc couldn't run" in result
+
+    def test_run_inner_monologue_replaced_by_summary(self, loop, mock_llm):
+        # internal-comms-agent turn-3 pattern
+        mock_llm.chat_with_tools.return_value = ToolCallResponse(
+            text=self._MONOLOGUE,
+            tool_calls=[ToolCall(
+                id="c1",
+                name="task_complete",
+                arguments={"summary": "FAQ 草稿已交付（含占位符）。"},
+            )],
+        )
+        result = loop.run("写 FAQ")
+        assert result == "FAQ 草稿已交付（含占位符）。"
+
+    def test_run_evaluation_block_stripped_on_text_exit(self, loop, mock_llm):
+        # mcp-builder OOD-turn leak: reply + <evaluation> block, no
+        # task_complete call — exercises the non-completion exit path.
+        mock_llm.chat_with_tools.return_value = ToolCallResponse(
+            text=(
+                "这个我帮不上忙——我是专门做 MCP 服务器开发的助手。\n\n"
+                "<evaluation>\n  <qa_pair>\n    <question>q</question>\n"
+                "    <answer>a</answer>\n  </qa_pair>\n</evaluation>\n"
+            ),
+            tool_calls=[],
+        )
+        result = loop.run("水龙头漏水怎么办")
+        assert "<evaluation>" not in result
+        assert "qa_pair" not in result
+        assert "MCP" in result
+
+    def test_run_kb_agent_pure_meta_also_falls_back(
+        self, mock_llm, capbus, sandbox, ctx
+    ):
+        # KB mode (max_consecutive_text_only=0): previously the 50% guard
+        # returned the pure-meta text unchanged — now it falls back to
+        # the task_complete summary as well.
+        kb_loop = ConversationLoop(
+            llm=mock_llm,
+            capbus=capbus,
+            sandbox=sandbox,
+            ctx=ctx,
+            max_consecutive_text_only=0,
+            nudge_grace=0,
+        )
+        mock_llm.chat_with_tools.return_value = ToolCallResponse(
+            text=(
+                "The task is complete. I already answered. "
+                "Let me call task_complete."
+            ),
+            tool_calls=[ToolCall(
+                id="c1",
+                name="task_complete",
+                arguments={"summary": "答案已给出。"},
+            )],
+        )
+        result = kb_loop.run("问题")
+        assert result == "答案已给出。"
+
+    def test_run_normal_answer_untouched(self, loop, mock_llm):
+        mock_llm.chat_with_tools.return_value = ToolCallResponse(
+            text="1+1 等于 2。",
+            tool_calls=[ToolCall(
+                id="c1", name="task_complete", arguments={"summary": "Done."}
+            )],
+        )
+        result = loop.run("1+1等于几")
+        assert result == "1+1 等于 2。"
+
+    # ── end-to-end: stream() completion branch ──
+
+    def test_stream_inner_monologue_history_holds_summary(
+        self, loop, mock_llm, ctx
+    ):
+        # The streamed chunks themselves cannot be recalled, but the
+        # recorded history must hold the sanitized version so the
+        # monologue cannot poison later turns.
+        response = ToolCallResponse(
+            text=self._MONOLOGUE,
+            tool_calls=[ToolCall(
+                id="c1",
+                name="task_complete",
+                arguments={"summary": "FAQ 草稿已交付。"},
+            )],
+        )
+
+        def gen():
+            yield StreamDelta(type="text", content=self._MONOLOGUE)
+            return response
+
+        mock_llm.stream_chat_with_tools.return_value = gen()
+        chunks = list(loop.stream("写 FAQ"))
+        streamed = "".join(c for c in chunks if isinstance(c, str))
+        assert streamed == self._MONOLOGUE
+        assert ctx.history[-1]["content"] == "FAQ 草稿已交付。"
+
+    def test_stream_pure_meta_history_falls_back_to_summary(
+        self, loop, mock_llm, ctx
+    ):
+        # allow_full_strip must reach the stream completion branch too:
+        # a response that is entirely meta-narration is stripped to
+        # nothing and the task_complete summary is recorded instead.
+        text = (
+            "The task is complete. I already answered. "
+            "Let me call task_complete."
+        )
+        response = ToolCallResponse(
+            text=text,
+            tool_calls=[ToolCall(
+                id="c1",
+                name="task_complete",
+                arguments={"summary": "已生成 sales_total.xlsx。"},
+            )],
+        )
+
+        def gen():
+            yield StreamDelta(type="text", content=text)
+            return response
+
+        mock_llm.stream_chat_with_tools.return_value = gen()
+        list(loop.stream("计算总额"))
+        assert ctx.history[-1]["content"] == "已生成 sales_total.xlsx。"

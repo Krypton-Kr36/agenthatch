@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agenthatch"
-version = "1.0.27"
+version = "1.0.28"
 description = "Turn any SKILL.md into a runnable AI Agent"
 readme = "README.md"
 license-files = ["LICENSE"]
@@ -88,7 +88,10 @@ testpaths = ["tests"]
 # happens to be pip-installed. A non-editable PyPI install otherwise
 # shadows local edits and the suite silently validates the published
 # wheel instead of the code under test.
-pythonpath = ["src"]
+# v1.0.28: same for agenthatch_core, which lives in agenthatch-core/src
+# and was still silently imported from site-packages when installed
+# non-editable.
+pythonpath = ["src", "agenthatch-core/src"]
 
 [tool.ruff]
 target-version = "py311"

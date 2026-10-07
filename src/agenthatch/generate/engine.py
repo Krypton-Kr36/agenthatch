@@ -168,7 +168,14 @@ class GenerateEngine:
         display_name = self._humanize_display_name(
             identity.get("display_name", "Unknown Agent"), agent_name
         )
-        version = identity.get("version", "")
+        # SKILL.md ``metadata.version`` is optional (Anthropic's official
+        # skills omit it entirely).  An empty string renders an invalid
+        # PEP-440 ``version = ""`` in pyproject.toml, and ``pip install``
+        # of the generated agent then fails at metadata-generation time
+        # (hatchling: Invalid version `` from field 'project.version').
+        # The breakage is silent at hatch time because ``agenthatch run``
+        # loads via sys.path injection and never installs the package.
+        version = (identity.get("version") or "").strip() or "0.1.0"
 
         # Derive package_name: kebab-case → snake_case
         package_name = agent_name.replace("-", "_")

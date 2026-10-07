@@ -301,6 +301,42 @@ class TestBug7PyprojectDeclaresKBDependencies:
         rendered = tpl.render(**ctx)
         assert f'"agenthatch>={agenthatch.__version__}"' in rendered
 
+    def test_engine_defaults_blank_version_to_0_1_0(self) -> None:
+        """A missing/blank SKILL.md version must never render ``version = ""``.
+
+        ``metadata.version`` is optional in the SKILL.md frontmatter
+        (Anthropic's official skills omit it), and an empty string is not
+        a valid PEP-440 version — hatchling rejects it at
+        metadata-generation time, so the generated agent could not be
+        ``pip install``ed at all.  The engine must fall back to a valid
+        default for every blank shape, and must not clobber an explicit
+        version.
+        """
+        from agenthatch.generate.engine import GenerateEngine
+
+        engine = GenerateEngine()
+        for identity in (
+            {"id": "test-agent"},
+            {"id": "test-agent", "version": ""},
+            {"id": "test-agent", "version": "   "},
+            {"id": "test-agent", "version": None},
+        ):
+            ctx = engine.extract_variables(
+                {"identity": identity, "intent": {"summary": "test"}}
+            )
+            assert ctx["version"] == "0.1.0", identity
+            rendered = engine._env.get_template("pyproject.toml.j2").render(**ctx)
+            assert 'version = "0.1.0"' in rendered
+            assert 'version = ""' not in rendered
+
+        ctx = engine.extract_variables(
+            {
+                "identity": {"id": "test-agent", "version": "2.3.4"},
+                "intent": {"summary": "test"},
+            }
+        )
+        assert ctx["version"] == "2.3.4"
+
 
 # ---------------------------------------------------------------------------
 # Bug #4: pyproject.toml.j2 packages knowledge/ directory

@@ -221,11 +221,33 @@ _TRAILING_META_NARRATION_PATTERNS: tuple[str, ...] = (
     r"[Nn]o remaining steps",
     # English: "Task complete" / "Task completed"
     r"[Tt]ask (?:is )?(?:complete|completed|done)",
+    # v1.0.28: Empirical variants harvested from real generated-agent
+    # transcripts (thinking-style models narrate their intent to call
+    # task_complete instead of delivering the answer).
+    # "call task_complete" in any wrapper: "Let me / I'll / I should /
+    # Should I ... call task_complete"
+    r"[Cc]all `?task_?complete`?",
+    # "Let me finalize."
+    r"[Ll]et me finalize",
+    # "I already answered / reported / output"
+    r"[Ii] already (?:answered|reported|output)",
+    # "I've delivered the answer"
+    r"[Ii]'ve delivered",
+    # "The (user's) request is (fully) done/fulfilled/complete"
+    r"[Tt]he (?:user'?s )?request is (?:fully )?(?:done|fulfilled|complete)",
+    # "The task is essentially/basically/now done|complete"
+    r"[Tt]he task is (?:essentially |basically |now )?(?:done|complete)",
+    # "All requests done"
+    r"[Aa]ll requests done",
+    # "Let me (quickly) double-check"
+    r"[Ll]et me (?:quickly )?double-?check",
 )
 
 
-def _strip_trailing_meta_narration(text: str) -> str:
-    """Strip trailing meta-narration from a KB agent response.
+def _strip_trailing_meta_narration(
+    text: str, *, allow_full_strip: bool = False
+) -> str:
+    """Strip trailing meta-narration from an agent response.
 
     v1.0.1 (R4-V21): The LLM often appends meta-commentary before
     calling task_complete, despite B4 (e) explicitly forbidding it.
@@ -241,7 +263,11 @@ def _strip_trailing_meta_narration(text: str) -> str:
     abort stripping entirely, leaking the meta-narration through.
 
     Safety: stripping is aborted if it would remove more than 50% of
-    the response (guard against false positives on short answers).
+    the response (guard against false positives on short answers),
+    unless ``allow_full_strip`` is set — used at task_complete
+    completion branches where the caller holds the task_complete
+    ``summary`` as a safe fallback, so a response that is *entirely*
+    meta-narration is stripped to nothing rather than leaked.
     """
     if not text or len(text) < 20:
         return text
@@ -299,7 +325,87 @@ def _strip_trailing_meta_narration(text: str) -> str:
     # Safety: don't strip if it removes more than 50% of the text
     if len(stripped) >= max(1, int(len(text) * 0.5)):
         return stripped
-    return text
+    return stripped if allow_full_strip else text
+
+
+# v1.0.28: <evaluation> XML blocks.  Skills that teach the model an
+# ``<evaluation>`` qa_pair format (e.g. mcp-builder) cause the model to
+# append the block to ordinary chat replies.  It is an internal
+# structured artifact, never user-facing content, so it is removed
+# unconditionally (no length guard).  Matches unclosed blocks too —
+# a truncated stream must not leak the partial XML either.
+_EVALUATION_BLOCK_RE = re.compile(r"\s*<evaluation>.*?(?:</evaluation>|\Z)", re.DOTALL)
+_DANGLING_HR_RE = re.compile(r"\n{1,2}(?:-{3,}|\*{3,})\s*\Z")
+
+
+def _strip_evaluation_blocks(text: str) -> str:
+    """Remove ``<evaluation>...</evaluation>`` XML blocks from text."""
+    if not text or "<evaluation>" not in text:
+        return text
+    stripped = _EVALUATION_BLOCK_RE.sub("", text)
+    # A horizontal rule that only separated the deliverable from the
+    # removed block would dangle at the end — drop it.
+    stripped = _DANGLING_HR_RE.sub("", stripped)
+    return stripped.strip()
+
+
+# v1.0.28: Inner-monologue markers.  Thinking-style models sometimes
+# dump their *entire reasoning process* into the visible text instead
+# of a deliverable ("Wait — ... Hmm ... Let me re-read ... I'll call
+# task_complete").  Sentence-level stripping cannot fix this because
+# every sentence IS the monologue.  When self-talk markers dominate
+# the response, the text is not a deliverable at all.
+_INNER_MONOLOGUE_PATTERNS: tuple[str, ...] = (
+    r"\b[Ww]ait\b\s*[—–,.\-]",
+    r"\b[Hh]mm\b",
+    r"[Bb]ut wait",
+    r"[Ll]et me (?:re-read|think|see)",
+    r"[Aa]ctually[,:]?\s+(?:I|the|careful)",
+    r"\bI (?:think|guess|believe)\b",
+    r"\bI should\b",
+    r"[Ii]'m (?:confused|not sure|unsure)",
+    r"[Tt]he user hasn'?t",
+    r"[Ss]hould I\b",
+    r"task_?complete",
+)
+
+
+def _is_inner_monologue(text: str) -> bool:
+    """Detect a response that IS the model's reasoning process.
+
+    Returns True when at least half of the sentences carry self-talk
+    markers.  Conservative by construction: requires >= 200 chars and
+    >= 4 sentences, so short deliverables are never misclassified.
+    Only consulted at task_complete completion branches, where the
+    task_complete ``summary`` provides a safe fallback.
+    """
+    if not text or len(text) < 200:
+        return False
+    sentences = [
+        s for s in re.split(r"(?<=[。！？.!?\n])\s*", text) if s.strip()
+    ]
+    if len(sentences) < 4:
+        return False
+    hits = sum(
+        1
+        for s in sentences
+        if any(re.search(p, s) for p in _INNER_MONOLOGUE_PATTERNS)
+    )
+    return hits * 2 >= len(sentences)
+
+
+def _sanitize_final_text(text: str, *, allow_full_strip: bool = False) -> str:
+    """Sanitize pipeline applied to every final answer.
+
+    v1.0.28: Previously gated behind ``max_consecutive_text_only == 0``
+    (KB agents only), so ordinary agents leaked meta-narration and
+    structured artifacts to the user.  The pipeline is now universal —
+    no agent's final answer may be its own thought process.
+    """
+    if not text:
+        return text
+    text = _strip_evaluation_blocks(text)
+    return _strip_trailing_meta_narration(text, allow_full_strip=allow_full_strip)
 
 
 class ConversationLoop:
@@ -524,12 +630,22 @@ class ConversationLoop:
                         # for KB agents was a meta-summary like "已回答…"
                         # rather than the substantive answer.
                         final_text = response.text or summary
-                        # v1.0.1 (R4-V21): Strip trailing meta-narration
-                        # for KB agents.  The LLM often appends sentences
-                        # like "已完整解答…无剩余步骤" before calling
-                        # task_complete, despite B4 (e) forbidding it.
-                        if self._max_consecutive_text_only == 0:
-                            final_text = _strip_trailing_meta_narration(final_text)
+                        # v1.0.28: Sanitize for ALL agents (previously
+                        # KB-only via the max_consecutive_text_only == 0
+                        # gate).  Text accompanying task_complete must be
+                        # the deliverable, never the model's thought
+                        # process: an inner monologue is replaced by the
+                        # task_complete summary, and aggressive stripping
+                        # falls back to the summary when nothing real
+                        # remains.
+                        if _is_inner_monologue(final_text):
+                            final_text = summary
+                        final_text = (
+                            _sanitize_final_text(
+                                final_text, allow_full_strip=True
+                            )
+                            or summary
+                        )
                         self.ctx.add_to_history("user", user_input)
                         self.ctx.add_to_history(
                             "assistant",
@@ -722,10 +838,10 @@ class ConversationLoop:
 
         self.ctx.add_to_history("user", user_input)
         final_text = response.text if response and response.text else ""
-        # v1.0.1 (R4-V21): Strip trailing meta-narration for KB agents
-        # on the non-task_complete exit path too.
-        if self._max_consecutive_text_only == 0:
-            final_text = _strip_trailing_meta_narration(final_text)
+        # v1.0.28: Sanitize for ALL agents on the non-task_complete exit
+        # path too.  The 50% guard is retained here — no summary fallback
+        # exists on this path.
+        final_text = _sanitize_final_text(final_text)
         if final_text:
             self.ctx.add_to_history(
                 "assistant",
@@ -1091,12 +1207,19 @@ class ConversationLoop:
                         else:
                             final_text = summary
                             yield summary
-                        # v1.0.1 (R4-V21): Strip trailing meta-narration
-                        # for KB agents.  The LLM often appends sentences
-                        # like "已完整解答…无剩余步骤" before calling
-                        # task_complete, despite B4 (e) forbidding it.
-                        if self._max_consecutive_text_only == 0:
-                            final_text = _strip_trailing_meta_narration(final_text)
+                        # v1.0.28: Same sanitize as the chat() completion
+                        # branch, for ALL agents.  Even when the raw text
+                        # was already streamed to the user, the recorded
+                        # history must hold the sanitized version so the
+                        # monologue cannot poison later turns.
+                        if _is_inner_monologue(final_text):
+                            final_text = summary
+                        final_text = (
+                            _sanitize_final_text(
+                                final_text, allow_full_strip=True
+                            )
+                            or summary
+                        )
                         self.ctx.add_to_history("user", user_input)
                         self.ctx.add_to_history(
                             "assistant",
@@ -1253,10 +1376,10 @@ class ConversationLoop:
 
         self.ctx.add_to_history("user", user_input)
         final_text = full_response_text or accumulated_text
-        # v1.0.1 (R4-V21): Strip trailing meta-narration for KB agents
-        # on the non-task_complete exit path too.
-        if self._max_consecutive_text_only == 0:
-            final_text = _strip_trailing_meta_narration(final_text)
+        # v1.0.28: Sanitize for ALL agents on the non-task_complete exit
+        # path too.  The 50% guard is retained here — no summary fallback
+        # exists on this path.
+        final_text = _sanitize_final_text(final_text)
         if final_text:
             self.ctx.add_to_history(
                 "assistant",
